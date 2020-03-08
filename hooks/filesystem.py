@@ -115,6 +115,27 @@ def guestfs_instance(self):
 
 class FilesystemHook(Hook):
 
+    """
+    The FilesystemHook will walk through the guest main filesystem using libguestfs.
+    The main filesystem is either the main partition, determined by OS inspection methods from libguestfs,
+    or using the first partition if OS is unknown after inspection
+
+    Configuration:
+
+    enumerate: Optional - Whether we should walk through the entire filesystem once to get a progress percentage
+                            on the real filesystem capture, which can be long
+    log_progress: Optional - Whether we should display a status update of the capture in the logs
+    log_progress_delay: Optional - How often to update the capture progress status
+    inode_checksums: Optional - Whether we should compute the checksum on each Inodes
+    filter: Optional - Define include or exclude filesystem filters for the capture.
+                        Filter can be defined using 'extensions' or 'mimes' (MIME types)
+                        Specifying both will result in 'extensions' being applied first
+    filter.type: Optional - include or exclude the file based on the filter configuration (possible values: 'include' or
+                            'exclude')
+    filter.extensions: Optional - a list of file extensions to filter on
+    filter.mimes: Optional - a list of MIME types obtained via the magic Python library to filter on
+    """
+
     def __init__(self, parameters):
         super().__init__(parameters)
         # config
@@ -122,6 +143,13 @@ class FilesystemHook(Hook):
         self.log_progress = self.configuration.get('log_progress', True)
         self.log_progress_delay = int(self.configuration.get('log_progress_delay', 0))
         self.inode_checksums = self.configuration.get('inode_checksums', False)
+        self.filter = self.configuration.get('filter')
+        if self.filter is not None:
+            # default filter: include
+            if 'type' not in self.filter:
+                self.filter['type'] = 'include'
+            if self.filter['type'] not in ['include', 'exclude']:
+                raise RuntimeError("Wrong configuration value for filter['type']. Either 'include' or 'exclude'")
 
         self.gfs = None
         self.tx = None
@@ -129,6 +157,31 @@ class FilesystemHook(Hook):
         self.total_entries = 0
         self.time_last_update = 0
         self.context.subscribe('offline', self.capture_fs)
+
+    def filter_node(self, inode: Inode):
+        """Use filters defined in hook configuration to determine if
+        this node should be included or excluded from the filesystem capture"""
+        if not self.filter:
+            # always include
+            return True
+        include = True if self.filter['type'] == 'include' else False
+
+        # only include the files matching 'extension' list or 'MIME' list
+        allowed_extensions = self.filter.get('extensions')
+        if allowed_extensions:
+            if include:
+                return inode.path.suffix in allowed_extensions
+            else:
+                # denied extensions
+                return inode.path.suffix not in allowed_extensions
+        allowed_mimes = self.filter.get('mimes')
+        if allowed_mimes:
+            if include:
+                return inode.mime_type in allowed_mimes
+            else:
+                # denied mimes
+                return inode.mime_type not in allowed_mimes
+        raise RuntimeError('Error in FilesystemHook filter configuration')
 
     def list_entries(self, node):
         # assume that node is a directory
@@ -184,21 +237,29 @@ class FilesystemHook(Hook):
         if not name:
             name = node.anchor
         inode = Inode(self.gfs, node)
-        self.context.trigger('filesystem_new_inode', inode=inode)
-        # download and execute trigger on local file
+        # apply filters
+        if self.filter_node(inode):
+            self.context.trigger('filesystem_new_inode', inode=inode)
+        # download and execute trigger on local file, if not filtered
         if InodeType(inode.inode_type) == InodeType.REG:
-            self.context.trigger('filesystem_new_file', inode=inode)
+            # apply filters
+            if self.filter_node(inode):
+                self.context.trigger('filesystem_new_file', inode=inode)
         # walk
         if self.gfs.is_dir(str(node)):
             entries = self.list_entries(node)
             for entry in entries:
                 subnode_abs = node / entry
                 child_inode = self.walk_capture(subnode_abs)
-                self.context.trigger('filesystem_new_child_inode', inode=inode, child=child_inode)
+                # apply filters
+                if self.filter_node(inode):
+                    self.context.trigger('filesystem_new_child_inode', inode=inode, child=child_inode)
                 # cleanup inode related resources
                 child_inode.close()
 
-        self.context.trigger('filesystem_end_children', inode=inode)
+        # apply filters
+        if self.filter_node(inode):
+            self.context.trigger('filesystem_end_children', inode=inode)
         return inode
 
     def update_log(self, node):
